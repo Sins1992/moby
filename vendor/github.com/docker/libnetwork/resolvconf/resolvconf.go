@@ -8,10 +8,15 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/libnetwork/resolvconf/dns"
 	"github.com/docker/libnetwork/types"
+	"github.com/sirupsen/logrus"
+)
+
+const (
+	// DefaultResolvConf points to the default file used for dns configuration on a linux machine
+	DefaultResolvConf = "/etc/resolv.conf"
 )
 
 var (
@@ -50,15 +55,7 @@ type File struct {
 
 // Get returns the contents of /etc/resolv.conf and its hash
 func Get() (*File, error) {
-	resolv, err := ioutil.ReadFile("/etc/resolv.conf")
-	if err != nil {
-		return nil, err
-	}
-	hash, err := ioutils.HashData(bytes.NewReader(resolv))
-	if err != nil {
-		return nil, err
-	}
-	return &File{Content: resolv, Hash: hash}, nil
+	return GetSpecific(DefaultResolvConf)
 }
 
 // GetSpecific returns the contents of the user specified resolv.conf file and its hash

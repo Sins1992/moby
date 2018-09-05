@@ -1,6 +1,7 @@
 package allocator
 
 import (
+	"net"
 	"sync"
 
 	"github.com/docker/docker/pkg/plugingetter"
@@ -32,6 +33,13 @@ type Allocator struct {
 
 	// pluginGetter provides access to docker's plugin inventory.
 	pluginGetter plugingetter.PluginGetter
+
+	// DefaultAddrPool specifies default subnet pool for global scope networks
+	defaultAddrPool []*net.IPNet
+
+	// SubnetSize specifies the subnet size of the networks created from
+	// the default subnet pool
+	subnetSize int
 }
 
 // taskBallot controls how the voting for task allocation is
@@ -51,13 +59,6 @@ type taskBallot struct {
 
 // allocActor controls the various phases in the lifecycle of one kind of allocator.
 type allocActor struct {
-	// Channel through which the allocator gets all the events
-	// that it is interested in.
-	ch chan events.Event
-
-	// cancel unregisters the watcher.
-	cancel func()
-
 	// Task voter identity of the allocator.
 	taskVoter string
 
@@ -72,15 +73,17 @@ type allocActor struct {
 
 // New returns a new instance of Allocator for use during allocation
 // stage of the manager.
-func New(store *store.MemoryStore, pg plugingetter.PluginGetter) (*Allocator, error) {
+func New(store *store.MemoryStore, pg plugingetter.PluginGetter, defaultAddrPool []*net.IPNet, subnetSize int) (*Allocator, error) {
 	a := &Allocator{
 		store: store,
 		taskBallot: &taskBallot{
 			votes: make(map[string][]string),
 		},
-		stopChan:     make(chan struct{}),
-		doneChan:     make(chan struct{}),
-		pluginGetter: pg,
+		stopChan:        make(chan struct{}),
+		doneChan:        make(chan struct{}),
+		pluginGetter:    pg,
+		defaultAddrPool: defaultAddrPool,
+		subnetSize:      subnetSize,
 	}
 
 	return a, nil
@@ -90,7 +93,10 @@ func New(store *store.MemoryStore, pg plugingetter.PluginGetter) (*Allocator, er
 func (a *Allocator) Run(ctx context.Context) error {
 	// Setup cancel context for all goroutines to use.
 	ctx, cancel := context.WithCancel(ctx)
-	var wg sync.WaitGroup
+	var (
+		wg     sync.WaitGroup
+		actors []func() error
+	)
 
 	defer func() {
 		cancel()
@@ -98,26 +104,8 @@ func (a *Allocator) Run(ctx context.Context) error {
 		close(a.doneChan)
 	}()
 
-	var actors []func() error
-	watch, watchCancel := state.Watch(a.store.WatchQueue(),
-		api.EventCreateNetwork{},
-		api.EventDeleteNetwork{},
-		api.EventCreateService{},
-		api.EventUpdateService{},
-		api.EventDeleteService{},
-		api.EventCreateTask{},
-		api.EventUpdateTask{},
-		api.EventDeleteTask{},
-		api.EventCreateNode{},
-		api.EventUpdateNode{},
-		api.EventDeleteNode{},
-		state.EventCommit{},
-	)
-
 	for _, aa := range []allocActor{
 		{
-			ch:        watch,
-			cancel:    watchCancel,
 			taskVoter: networkVoter,
 			init:      a.doNetworkInit,
 			action:    a.doNetworkAlloc,
@@ -127,8 +115,8 @@ func (a *Allocator) Run(ctx context.Context) error {
 			a.registerToVote(aa.taskVoter)
 		}
 
-		// Copy the iterated value for variable capture.
-		aaCopy := aa
+		// Assign a pointer for variable capture
+		aaPtr := &aa
 		actor := func() error {
 			wg.Add(1)
 			defer wg.Done()
@@ -136,19 +124,19 @@ func (a *Allocator) Run(ctx context.Context) error {
 			// init might return an allocator specific context
 			// which is a child of the passed in context to hold
 			// allocator specific state
-			if err := aaCopy.init(ctx); err != nil {
-				// Stop the watches for this allocator
-				// if we are failing in the init of
-				// this allocator.
-				aa.cancel()
+			watch, watchCancel, err := a.init(ctx, aaPtr)
+			if err != nil {
 				return err
 			}
 
 			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				a.run(ctx, aaCopy)
-			}()
+			go func(watch <-chan events.Event, watchCancel func()) {
+				defer func() {
+					wg.Done()
+					watchCancel()
+				}()
+				a.run(ctx, *aaPtr, watch)
+			}(watch, watchCancel)
 			return nil
 		}
 
@@ -172,10 +160,34 @@ func (a *Allocator) Stop() {
 	<-a.doneChan
 }
 
-func (a *Allocator) run(ctx context.Context, aa allocActor) {
+func (a *Allocator) init(ctx context.Context, aa *allocActor) (<-chan events.Event, func(), error) {
+	watch, watchCancel := state.Watch(a.store.WatchQueue(),
+		api.EventCreateNetwork{},
+		api.EventDeleteNetwork{},
+		api.EventCreateService{},
+		api.EventUpdateService{},
+		api.EventDeleteService{},
+		api.EventCreateTask{},
+		api.EventUpdateTask{},
+		api.EventDeleteTask{},
+		api.EventCreateNode{},
+		api.EventUpdateNode{},
+		api.EventDeleteNode{},
+		state.EventCommit{},
+	)
+
+	if err := aa.init(ctx); err != nil {
+		watchCancel()
+		return nil, nil, err
+	}
+
+	return watch, watchCancel, nil
+}
+
+func (a *Allocator) run(ctx context.Context, aa allocActor, watch <-chan events.Event) {
 	for {
 		select {
-		case ev, ok := <-aa.ch:
+		case ev, ok := <-watch:
 			if !ok {
 				return
 			}

@@ -1,13 +1,19 @@
-package swarm
+package swarm // import "github.com/docker/docker/api/types/swarm"
 
-import "time"
+import (
+	"time"
+)
 
-// ClusterInfo represents info about the cluster for outputing in "info"
+// ClusterInfo represents info about the cluster for outputting in "info"
 // it contains the same information as "Swarm", but without the JoinTokens
 type ClusterInfo struct {
 	ID string
 	Meta
-	Spec Spec
+	Spec                   Spec
+	TLSInfo                TLSInfo
+	RootRotationInProgress bool
+	DefaultAddrPool        []string
+	SubnetSize             uint32
 }
 
 // Swarm represents a swarm.
@@ -107,6 +113,16 @@ type CAConfig struct {
 	// ExternalCAs is a list of CAs to which a manager node will make
 	// certificate signing requests for node certificates.
 	ExternalCAs []*ExternalCA `json:",omitempty"`
+
+	// SigningCACert and SigningCAKey specify the desired signing root CA and
+	// root CA key for the swarm.  When inspecting the cluster, the key will
+	// be redacted.
+	SigningCACert string `json:",omitempty"`
+	SigningCAKey  string `json:",omitempty"`
+
+	// If this value changes, and there is no specified signing cert and key,
+	// then the swarm is forced to generate a new root certificate ane key.
+	ForceRotate uint64 `json:",omitempty"`
 }
 
 // ExternalCAProtocol represents type of external CA.
@@ -141,6 +157,8 @@ type InitRequest struct {
 	Spec             Spec
 	AutoLockManagers bool
 	Availability     NodeAvailability
+	DefaultAddrPool  []string
+	SubnetSize       uint32
 }
 
 // JoinRequest is the request used to join a swarm.
